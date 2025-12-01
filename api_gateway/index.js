@@ -1,10 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const CircuitBreaker = require('opossum');
-const { authenticateToken, authorizeRoles } = require('./middleware/auth');
-const { authLimiter, apiLimiter } = require('./middleware/rateLimit');
+const Joi = require('joi');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -13,76 +10,90 @@ const PORT = process.env.PORT || 8000;
 app.use(cors());
 app.use(express.json());
 
-// Добавляем middleware для добавления X-Request-ID
+// Импортируем наши модули
+const User = require('./models/User');
+const { hashPassword, comparePassword, validatePassword } = require('./utils/passwordUtils');
+const { generateToken, validateUserData } = require('./utils/jwtUtils');
+const { validateRequest, checkPermissions } = require('./middleware/validation');
+
+// Middleware для логирования
 app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  req.headers['x-request-id'] = requestId;
-  res.setHeader('X-Request-ID', requestId);
+  const requestId = req.headers['x-request-id'] || 'unknown';
+  console.log(`[${new Date().toISOString()}] [${requestId}] ${req.method} ${req.url}`);
   next();
 });
 
-// Service URLs
-const USERS_SERVICE_URL = process.env.USERS_SERVICE_URL || 'http://service_users:8000';
-const ORDERS_SERVICE_URL = process.env.ORDERS_SERVICE_URL || 'http://service_orders:8000';
+// ==================== SCHEMAS FOR VALIDATION ====================
 
-// Circuit Breaker configuration
-const circuitOptions = {
-  timeout: 5000,
-  errorThresholdPercentage: 50,
-  resetTimeout: 30000,
-};
+const registerSchema = Joi.object({
+  email: Joi.string().email().required().messages({
+    'string.email': 'Некорректный формат email',
+    'any.required': 'Email обязателен'
+  }),
+  password: Joi.string().min(6).required().messages({
+    'string.min': 'Пароль должен содержать минимум 6 символов',
+    'any.required': 'Пароль обязателен'
+  }),
+  name: Joi.string().min(2).required().messages({
+    'string.min': 'Имя должно содержать минимум 2 символа',
+    'any.required': 'Имя обязательно'
+  }),
+  role: Joi.string().valid('user', 'engineer', 'manager', 'admin').default('user')
+});
 
-// Create circuit breakers
-const createCircuitBreaker = (serviceName) => {
-  const circuit = new CircuitBreaker(async (url, options = {}) => {
-    try {
-      const response = await axios({
-        url,
-        ...options,
-        headers: {
-          ...options.headers,
-          'x-request-id': options.headers?.['x-request-id'] || 'unknown',
-        },
-        validateStatus: status => (status >= 200 && status < 300) || status === 404
-      });
-      return response.data;
-    } catch (error) {
-      if (error.response && error.response.status === 404) {
-        return error.response.data;
-      }
-      throw error;
-    }
-  }, circuitOptions);
+const loginSchema = Joi.object({
+  email: Joi.string().email().required(),
+  password: Joi.string().required()
+});
 
-  circuit.fallback(() => ({
-    success: false,
-    error: {
-      code: 'SERVICE_UNAVAILABLE',
-      message: `${serviceName} service temporarily unavailable`
-    }
-  }));
+const updateUserSchema = Joi.object({
+  name: Joi.string().min(2),
+  email: Joi.string().email(),
+  role: Joi.string().valid('user', 'engineer', 'manager', 'admin')
+}).min(1);
 
-  return circuit;
-};
+// ==================== AUTH ROUTES ====================
 
-const usersCircuit = createCircuitBreaker('Users');
-const ordersCircuit = createCircuitBreaker('Orders');
-
-// ==================== PUBLIC ROUTES (без аутентификации) ====================
-
-// Регистрация - публичный доступ
-app.post('/api/v1/auth/register', authLimiter, async (req, res) => {
+// Регистрация пользователя
+app.post('/api/v1/auth/register', validateRequest(registerSchema), async (req, res) => {
   try {
-    const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/api/v1/auth/register`, {
-      method: 'POST',
-      data: req.body,
-      headers: {
-        'x-request-id': req.headers['x-request-id']
+    const { email, password, name, role } = req.validatedData;
+    
+    // Проверяем, нет ли уже пользователя с таким email
+    const existingUser = User.findByEmail(email);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'USER_EXISTS',
+          message: 'Пользователь с таким email уже существует'
+        }
+      });
+    }
+    
+    // Хешируем пароль
+    const hashedPassword = await hashPassword(password);
+    
+    // Создаем пользователя
+    const user = User.create({
+      email,
+      password: hashedPassword,
+      name,
+      role
+    });
+    
+    // Генерируем токен
+    const token = generateToken(user);
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        user: user.toJSON(),
+        token
       }
     });
-    res.status(201).json(user);
   } catch (error) {
-    console.error('Registration error:', error.message);
+    console.error('Registration error:', error);
     res.status(500).json({
       success: false,
       error: {
@@ -93,19 +104,47 @@ app.post('/api/v1/auth/register', authLimiter, async (req, res) => {
   }
 });
 
-// Вход - публичный доступ
-app.post('/api/v1/auth/login', authLimiter, async (req, res) => {
+// Вход пользователя
+app.post('/api/v1/auth/login', validateRequest(loginSchema), async (req, res) => {
   try {
-    const result = await usersCircuit.fire(`${USERS_SERVICE_URL}/api/v1/auth/login`, {
-      method: 'POST',
-      data: req.body,
-      headers: {
-        'x-request-id': req.headers['x-request-id']
+    const { email, password } = req.validatedData;
+    
+    // Ищем пользователя
+    const user = User.findByEmail(email);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
+    }
+    
+    // Проверяем пароль
+    const isValidPassword = await comparePassword(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
+    }
+    
+    // Генерируем токен
+    const token = generateToken(user);
+    
+    res.json({
+      success: true,
+      data: {
+        user: user.toJSON(),
+        token
       }
     });
-    res.json(result);
   } catch (error) {
-    console.error('Login error:', error.message);
+    console.error('Login error:', error);
     res.status(500).json({
       success: false,
       error: {
@@ -116,153 +155,112 @@ app.post('/api/v1/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// ==================== PROTECTED ROUTES (требуется аутентификация) ====================
+// ==================== USER ROUTES ====================
 
-// Группа маршрутов для пользователей с аутентификацией
-app.use('/api/v1/users*', authenticateToken);
-
-// Получить профиль текущего пользователя
-app.get('/api/v1/users/me', async (req, res) => {
+// Получить профиль пользователя
+app.get('/api/v1/users/:userId', checkPermissions(), (req, res) => {
   try {
-    const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/api/v1/users/${req.user.userId}`, {
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
-      }
+    const user = User.findById(req.params.userId);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'Пользователь не найден'
+        }
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: user.toJSON()
     });
-    res.json(user);
   } catch (error) {
-    console.error('Get profile error:', error.message);
+    console.error('Get user error:', error);
     res.status(500).json({
       success: false,
       error: {
         code: 'INTERNAL_SERVER_ERROR',
-        message: 'Ошибка при получении профиля'
+        message: 'Ошибка при получении пользователя'
       }
     });
   }
 });
 
-// Обновить профиль
-app.put('/api/v1/users/me', async (req, res) => {
+// Обновить профиль пользователя
+app.put('/api/v1/users/:userId', checkPermissions(), validateRequest(updateUserSchema), async (req, res) => {
   try {
-    const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/api/v1/users/${req.user.userId}`, {
-      method: 'PUT',
-      data: req.body,
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
+    const user = User.findById(req.params.userId);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'Пользователь не найден'
+        }
+      });
+    }
+    
+    // Если обновляется email, проверяем что он не занят
+    if (req.validatedData.email && req.validatedData.email !== user.email) {
+      const existingUser = User.findByEmail(req.validatedData.email);
+      if (existingUser && existingUser.id !== user.id) {
+        return res.status(409).json({
+          success: false,
+          error: {
+            code: 'EMAIL_EXISTS',
+            message: 'Email уже используется другим пользователем'
+          }
+        });
       }
+    }
+    
+    // Обновляем пользователя
+    user.update(req.validatedData);
+    
+    res.json({
+      success: true,
+      data: user.toJSON()
     });
-    res.json(user);
   } catch (error) {
-    console.error('Update profile error:', error.message);
+    console.error('Update user error:', error);
     res.status(500).json({
       success: false,
       error: {
         code: 'INTERNAL_SERVER_ERROR',
-        message: 'Ошибка при обновлении профиля'
+        message: 'Ошибка при обновлении пользователя'
       }
     });
   }
 });
 
-// Админские маршруты (только для админов)
-app.get('/api/v1/users', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+// Получить список пользователей (только для админов)
+app.get('/api/v1/users', checkPermissions('admin'), (req, res) => {
   try {
-    const queryParams = new URLSearchParams(req.query).toString();
-    const users = await usersCircuit.fire(`${USERS_SERVICE_URL}/api/v1/users?${queryParams}`, {
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
-      }
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    
+    const filters = {
+      role: req.query.role,
+      search: req.query.search
+    };
+    
+    const result = User.findAll(page, limit, filters);
+    
+    res.json({
+      success: true,
+      data: result.data.map(user => user.toJSON()),
+      pagination: result.pagination
     });
-    res.json(users);
   } catch (error) {
-    console.error('Get users error:', error.message);
+    console.error('Get users list error:', error);
     res.status(500).json({
       success: false,
       error: {
         code: 'INTERNAL_SERVER_ERROR',
         message: 'Ошибка при получении списка пользователей'
-      }
-    });
-  }
-});
-
-// ==================== ORDERS ROUTES ====================
-
-// Группа маршрутов для заказов с аутентификацией
-app.use('/api/v1/orders*', authenticateToken);
-
-// Создать заказ
-app.post('/api/v1/orders', async (req, res) => {
-  try {
-    const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/api/v1/orders`, {
-      method: 'POST',
-      data: { ...req.body, userId: req.user.userId },
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
-      }
-    });
-    res.status(201).json(order);
-  } catch (error) {
-    console.error('Create order error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: {
-        code: 'INTERNAL_SERVER_ERROR',
-        message: 'Ошибка при создании заказа'
-      }
-    });
-  }
-});
-
-// Получить заказы текущего пользователя
-app.get('/api/v1/orders', async (req, res) => {
-  try {
-    const queryParams = new URLSearchParams({
-      ...req.query,
-      userId: req.user.userId
-    }).toString();
-    
-    const orders = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/api/v1/orders?${queryParams}`, {
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
-      }
-    });
-    res.json(orders);
-  } catch (error) {
-    console.error('Get orders error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: {
-        code: 'INTERNAL_SERVER_ERROR',
-        message: 'Ошибка при получении заказов'
-      }
-    });
-  }
-});
-
-// Получить конкретный заказ
-app.get('/api/v1/orders/:orderId', async (req, res) => {
-  try {
-    const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/api/v1/orders/${req.params.orderId}`, {
-      headers: {
-        'x-request-id': req.headers['x-request-id'],
-        'x-user-id': req.user.userId
-      }
-    });
-    res.json(order);
-  } catch (error) {
-    console.error('Get order error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: {
-        code: 'INTERNAL_SERVER_ERROR',
-        message: 'Ошибка при получении заказа'
       }
     });
   }
@@ -274,18 +272,9 @@ app.get('/health', (req, res) => {
   res.json({
     success: true,
     data: {
-      status: 'API Gateway is running',
+      status: 'Users service is running',
       timestamp: new Date().toISOString(),
-      circuits: {
-        users: {
-          status: usersCircuit.status,
-          stats: usersCircuit.stats
-        },
-        orders: {
-          status: ordersCircuit.status,
-          stats: ordersCircuit.stats
-        }
-      }
+      userCount: User.findAll().data.length
     }
   });
 });
@@ -294,9 +283,8 @@ app.get('/api/v1/status', (req, res) => {
   res.json({
     success: true,
     data: {
-      status: 'API Gateway v1 is running',
-      version: '1.0.0',
-      timestamp: new Date().toISOString()
+      status: 'Users service v1 is running',
+      version: '1.0.0'
     }
   });
 });
@@ -327,15 +315,24 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`API Gateway running on port ${PORT}`);
-
-  // Log circuit breaker events
-  usersCircuit.on('open', () => console.log('Users circuit breaker opened'));
-  usersCircuit.on('close', () => console.log('Users circuit breaker closed'));
-  usersCircuit.on('halfOpen', () => console.log('Users circuit breaker half-open'));
-
-  ordersCircuit.on('open', () => console.log('Orders circuit breaker opened'));
-  ordersCircuit.on('close', () => console.log('Orders circuit breaker closed'));
-  ordersCircuit.on('halfOpen', () => console.log('Orders circuit breaker half-open'));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Users service running on port ${PORT}`);
+  
+  // Хешируем пароли тестовых пользователей при запуске
+  const bcrypt = require('bcryptjs');
+  const saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS) || 10;
+  const testPassword = 'password123';
+  
+  // Обновляем пароли тестовых пользователей
+  const users = User.findAll().data;
+  users.forEach(async (user) => {
+    if (user.password === '$2a$10$YourHashedPasswordHere') {
+      user.password = await bcrypt.hash(testPassword, saltRounds);
+    }
+  });
+  
+  console.log('Test users created with password "password123"');
+  console.log('- admin@example.com (admin)');
+  console.log('- manager@example.com (manager)');
+  console.log('- engineer@example.com (engineer)');
 });
