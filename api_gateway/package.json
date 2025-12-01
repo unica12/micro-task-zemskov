@@ -16,7 +16,9 @@
     "express-rate-limit": "^8.2.1",
     "joi": "^18.0.2",
     "jsonwebtoken": "^9.0.2",
-    "opossum": "^7.0.0"
+    "opossum": "^7.0.0",
+    "pino": "^10.1.0",
+    "pino-http": "^11.0.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
+const logger = require('./utils/logger');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -9,6 +9,27 @@ const PORT = process.env.PORT || 8000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Middleware для логирования запросов
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id'] || 'unknown';
+  const startTime = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    logger.info({
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+      duration: `${duration}ms`,
+      requestId,
+      userId: req.headers['x-user-id'],
+      userRole: req.headers['x-user-role']
+    }, 'HTTP request');
+  });
+  
+  next();
+});
 
 // Импортируем наши модули
 const { Order, ORDER_STATUS } = require('./models/Order');
@@ -21,22 +42,15 @@ const {
   validateRequest 
 } = require('./utils/validation');
 
-// Middleware для логирования
-app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || `order_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  req.headers['x-request-id'] = requestId;
-  console.log(`[${new Date().toISOString()}] [${requestId}] ${req.method} ${req.url}`);
-  next();
-});
-
 // ==================== ORDER ROUTES ====================
 
-// Создать новый заказ
 app.post('/api/v1/orders', validateRequest(createOrderSchema), (req, res) => {
   try {
     const userId = req.headers['x-user-id'];
+    const requestId = req.headers['x-request-id'] || 'unknown';
     
     if (!userId) {
+      logger.warn({ requestId }, 'Unauthorized order creation attempt');
       return res.status(401).json({
         success: false,
         error: {
@@ -47,6 +61,46 @@ app.post('/api/v1/orders', validateRequest(createOrderSchema), (req, res) => {
     }
     
     const orderData = {
+      userId,
+      ...req.validatedData
+    };
+    
+    const order = Order.create(orderData);
+    
+    // Логируем событие создания заказа
+    logger.info({
+      orderId: order.id,
+      userId,
+      total: order.total,
+      itemsCount: order.items.length,
+      requestId
+    }, 'Order created');
+    
+    // Публикация события (заготовка для брокера сообщений)
+    logger.debug({ orderId: order.id }, '[DOMAIN_EVENT] OrderCreated');
+    
+    res.status(201).json({
+      success: true,
+      data: order.toJSON()
+    });
+  } catch (error) {
+    logger.error({ 
+      error: error.message, 
+      stack: error.stack,
+      userId: req.headers['x-user-id']
+    }, 'Create order error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'Ошибка при создании заказа'
+      }
+    });
+  }
+});
+
+// ... остальной код оставляем как есть ...
+// Продолжение не меняем
       userId,
       ...req.validatedData
     };

@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Joi = require('joi');
+const logger = require('./utils/logger');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -10,34 +11,38 @@ const PORT = process.env.PORT || 8000;
 app.use(cors());
 app.use(express.json());
 
-// Импортируем наши модули
-const User = require('./models/User');
-const { hashPassword, comparePassword, validatePassword } = require('./utils/passwordUtils');
-const { generateToken, validateUserData } = require('./utils/jwtUtils');
-const { validateRequest, checkPermissions } = require('./middleware/validation');
-
-// Middleware для логирования
+// Middleware для логирования запросов
 app.use((req, res, next) => {
   const requestId = req.headers['x-request-id'] || 'unknown';
-  console.log(`[${new Date().toISOString()}] [${requestId}] ${req.method} ${req.url}`);
+  const startTime = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    logger.info({
+      method: req.method,
+      url: req.url,
+      statusCode: res.statusCode,
+      duration: `${duration}ms`,
+      requestId,
+      userId: req.headers['x-user-id']
+    }, 'HTTP request');
+  });
+  
   next();
 });
 
-// ==================== SCHEMAS FOR VALIDATION ====================
+// Импортируем наши модули
+const User = require('./models/User');
+const { hashPassword, comparePassword } = require('./utils/passwordUtils');
+const { generateToken } = require('./utils/jwtUtils');
+const { validateRequest, checkPermissions } = require('./middleware/validation');
+
+// ==================== SCHEMAS ====================
 
 const registerSchema = Joi.object({
-  email: Joi.string().email().required().messages({
-    'string.email': 'Некорректный формат email',
-    'any.required': 'Email обязателен'
-  }),
-  password: Joi.string().min(6).required().messages({
-    'string.min': 'Пароль должен содержать минимум 6 символов',
-    'any.required': 'Пароль обязателен'
-  }),
-  name: Joi.string().min(2).required().messages({
-    'string.min': 'Имя должно содержать минимум 2 символа',
-    'any.required': 'Имя обязательно'
-  }),
+  email: Joi.string().email().required(),
+  password: Joi.string().min(6).required(),
+  name: Joi.string().min(2).required(),
   role: Joi.string().valid('user', 'engineer', 'manager', 'admin').default('user')
 });
 
@@ -54,14 +59,14 @@ const updateUserSchema = Joi.object({
 
 // ==================== AUTH ROUTES ====================
 
-// Регистрация пользователя
 app.post('/api/v1/auth/register', validateRequest(registerSchema), async (req, res) => {
   try {
     const { email, password, name, role } = req.validatedData;
+    const requestId = req.headers['x-request-id'] || 'unknown';
     
-    // Проверяем, нет ли уже пользователя с таким email
     const existingUser = User.findByEmail(email);
     if (existingUser) {
+      logger.warn({ email, requestId }, 'Registration failed - user already exists');
       return res.status(409).json({
         success: false,
         error: {
@@ -71,19 +76,11 @@ app.post('/api/v1/auth/register', validateRequest(registerSchema), async (req, r
       });
     }
     
-    // Хешируем пароль
     const hashedPassword = await hashPassword(password);
-    
-    // Создаем пользователя
-    const user = User.create({
-      email,
-      password: hashedPassword,
-      name,
-      role
-    });
-    
-    // Генерируем токен
+    const user = User.create({ email, password: hashedPassword, name, role });
     const token = generateToken(user);
+    
+    logger.info({ userId: user.id, email, role, requestId }, 'User registered successfully');
     
     res.status(201).json({
       success: true,
@@ -93,12 +90,100 @@ app.post('/api/v1/auth/register', validateRequest(registerSchema), async (req, r
       }
     });
   } catch (error) {
-    console.error('Registration error:', error);
+    logger.error({ error: error.message, stack: error.stack }, 'Registration error');
     res.status(500).json({
       success: false,
       error: {
         code: 'INTERNAL_SERVER_ERROR',
         message: 'Ошибка при регистрации'
+      }
+    });
+  }
+});
+
+app.post('/api/v1/auth/login', validateRequest(loginSchema), async (req, res) => {
+  try {
+    const { email, password } = req.validatedData;
+    const requestId = req.headers['x-request-id'] || 'unknown';
+    
+    const user = User.findByEmail(email);
+    if (!user) {
+      logger.warn({ email, requestId }, 'Login failed - user not found');
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
+    }
+    
+    const isValidPassword = await comparePassword(password, user.password);
+    if (!isValidPassword) {
+      logger.warn({ email, requestId }, 'Login failed - invalid password');
+      return res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Неверный email или пароль'
+        }
+      });
+    }
+    
+    const token = generateToken(user);
+    
+    logger.info({ userId: user.id, email, role: user.role, requestId }, 'User logged in successfully');
+    
+    res.json({
+      success: true,
+      data: {
+        user: user.toJSON(),
+        token
+      }
+    });
+  } catch (error) {
+    logger.error({ error: error.message, stack: error.stack }, 'Login error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'Ошибка при входе'
+      }
+    });
+  }
+});
+
+// ==================== USER ROUTES ====================
+
+app.get('/api/v1/users/:userId', checkPermissions(), (req, res) => {
+  try {
+    const user = User.findById(req.params.userId);
+    const requestId = req.headers['x-request-id'] || 'unknown';
+    
+    if (!user) {
+      logger.warn({ userId: req.params.userId, requestId }, 'User not found');
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'Пользователь не найден'
+        }
+      });
+    }
+    
+    logger.debug({ userId: user.id, requestId }, 'User profile retrieved');
+    
+    res.json({
+      success: true,
+      data: user.toJSON()
+    });
+  } catch (error) {
+    logger.error({ error: error.message, stack: error.stack }, 'Get user error');
+    res.status(500).json({
+      success: false,
+      error: {
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'Ошибка при получении пользователя'
       }
     });
   }
