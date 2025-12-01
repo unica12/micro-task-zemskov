@@ -8,12 +8,13 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
     "axios": "^1.5.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
     "opossum": "^7.0.0"
   },
   "devDependencies": {
+    "eslint": "^9.39.1",
     "nodemon": "^3.0.1"
   }
 }
