@@ -18,7 +18,9 @@
     "jsonwebtoken": "^9.0.2",
     "opossum": "^7.0.0",
     "pino": "^10.1.0",
-    "pino-http": "^11.0.0"
+    "pino-http": "^11.0.0",
+    "swagger-ui-express": "^5.0.1",
+    "yamljs": "^0.3.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

@@ -15,7 +15,7 @@
     "jsonwebtoken": "^9.0.2",
     "pino": "^10.1.0",
     "pino-http": "^11.0.0",
-    "uuid": "^13.0.0"
+    "uuid": "^8.3.2"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.10",
